@@ -1,0 +1,5 @@
+PyYAML
+evdev
+pynput
+Pillow
+pystray

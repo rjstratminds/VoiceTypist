@@ -1,0 +1,16 @@
+[Unit]
+Description=VoiceTypist Linux Dictation
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/opt/VoiceTypist
+ExecStart=%h/opt/VoiceTypist/venv/bin/python %h/opt/VoiceTypist/voicetypist_linux.py
+Environment=PATH=%h/opt/VoiceTypist/venv/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/opt/VoiceTypist/venv/lib/python3.12/site-packages
+Environment=XAUTHORITY=%h/.Xauthority
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
