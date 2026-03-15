@@ -6,11 +6,12 @@ The implementation is intentionally simple:
 
 - one Python entry point
 - one user `systemd` service
+- optional user `ydotoold` service
 - local audio capture
 - local or in-process ASR
 - optional cloud-side transcript refinement
-- X11 text injection
-- GTK tray menu for backend switching on X11/GNOME
+- configurable text injection with `ydotool` or `xdotool`
+- AppIndicator or GTK tray menu depending on desktop
 - bottom-center GTK recording HUD
 
 ## Runtime Flow
@@ -45,7 +46,7 @@ On stop:
 - tray state changes to `Refining`
 - the selected ASR backend transcribes the capture
 - Gemini optionally rewrites the final transcript
-- `xdotool` types the result into the focused X11 window
+- the configured typing backend types the result into the focused app
 - tray state returns to `Idle`
 
 On cancel:
@@ -115,13 +116,19 @@ If the API key is missing or the request fails, VoiceTypist falls back to the un
 
 ## Output Injection
 
-Text output is currently implemented with:
+Text output is implemented with one of these backends:
 
 ```text
-xdotool type --clearmodifiers
+ydotool type ...
 ```
 
-That makes X11 connectivity a hard requirement for successful typing in the current implementation.
+or:
+
+```text
+xdotool type --clearmodifiers ...
+```
+
+`ydotool` is the preferred path for Plasma/Wayland-style hosts. `xdotool` remains available as fallback for X11-oriented setups.
 
 ## Tray State Model
 
@@ -143,12 +150,13 @@ Color mapping:
 - listening: red
 - processing: blue
 
-On this machine, the practical tray backend is GTK `StatusIcon`.
+Tray backend selection is environment-dependent.
 
-Why:
+Preferred order:
 
-- the X11 `pystray` backend does not implement real menus
-- GTK gives a clickable menu for backend switching under GNOME/X11
+- Ayatana AppIndicator when available
+- GTK `StatusIcon`
+- `pystray` fallback
 
 Current tray menu actions:
 
@@ -218,6 +226,8 @@ Current config keys:
 - `asr`
 - `model`
 - `whisper_bin`
+- `whisper_threads`
+- `type_backend`
 - `parakeet_model`
 - `gemini_model`
 - `rewrite_system_prompt`
@@ -246,6 +256,7 @@ Healthy GNOME/X11 fallback logs may instead show:
 
 Tray startup may show:
 
+- `Tray icon started (AppIndicator)`
 - `Tray icon started (GTK)`
 
 Typical healthy Parakeet logs after the first transcription include:
@@ -257,7 +268,8 @@ If CUDA is not available, the same line will report `cpu` instead.
 
 Recent builds also log:
 
-- `Typed text (N chars)` on successful X11 injection
+- `Typed text (N chars) via ydotool`
+- `Typed text (N chars) via xdotool`
 - `xdotool type failed: ...` when typing fails
 
 ## Known Constraints

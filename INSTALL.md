@@ -6,9 +6,9 @@ VoiceTypist expects a Linux desktop environment with:
 
 - Python 3.12 or compatible Python 3
 - `ffmpeg`
-- `xdotool`
+- `ydotool` or `xdotool`
 - PipeWire or PulseAudio
-- X11 access for text injection
+- `evdev` access for hotkeys or X11 access for `pynput`
 
 Python dependencies from `requirements.txt`:
 
@@ -18,7 +18,7 @@ Python dependencies from `requirements.txt`:
 - `Pillow`
 - `pystray`
 
-The current tray implementation on this machine also uses system GTK bindings available from the host Python environment.
+The current tray implementation also uses system GTK bindings available from the host Python environment. On Plasma/Wayland hosts it can additionally use Ayatana AppIndicator bindings from the host Python environment.
 
 For the `whisper` backend you also need:
 
@@ -54,7 +54,7 @@ python3 -m venv venv
 Install the equivalents of these packages for your distro:
 
 ```bash
-sudo apt install ffmpeg xdotool python3-venv
+sudo apt install ffmpeg python3-venv xdotool ydotool
 ```
 
 You may also need development headers or desktop integration packages depending on your distro and Python environment.
@@ -73,6 +73,8 @@ Example config:
 asr: whisper
 model: ~/whisper.cpp/models/ggml-small.en.bin
 whisper_bin: ~/whisper.cpp/build/bin/whisper-cli
+whisper_threads: 8
+type_backend: auto
 parakeet_model: nvidia/parakeet-tdt-0.6b-v3
 gemini_model: gemini-2.5-flash-lite
 audio_source: default
@@ -84,6 +86,30 @@ Point these values at your local `whisper.cpp` install:
 
 - `whisper_bin`
 - `model`
+- `whisper_threads`
+
+### Whisper On NVIDIA GPU
+
+If the host has an NVIDIA GPU and you want Whisper rather than Parakeet, build `whisper.cpp` with CUDA enabled and point `whisper_bin` at that build.
+
+Typical build:
+
+```bash
+cmake -S ~/whisper.cpp -B ~/whisper.cpp/build-cuda -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build ~/whisper.cpp/build-cuda --config Release -j "$(nproc)" --target whisper-cli
+```
+
+Then set:
+
+```yaml
+whisper_bin: ~/whisper.cpp/build-cuda/bin/whisper-cli
+```
+
+Verify with:
+
+```bash
+ldd ~/whisper.cpp/build-cuda/bin/whisper-cli | rg 'ggml-cuda|cublas|cudart'
+```
 
 ### Parakeet Setup
 
@@ -197,9 +223,22 @@ Or, if `evdev` is not available:
 
 - `Hotkey backend: pynput`
 
-On the current GNOME/X11 path, you may instead see:
+On GNOME/X11-style hosts, you may instead see:
 
 - `Tray icon started (GTK)`
+
+On Plasma/Wayland-style hosts with AppIndicator support, you may see:
+
+- `Tray icon started (AppIndicator)`
+
+If `type_backend` is `ydotool`, also verify the daemon first:
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 644 systemd/ydotoold.service ~/.config/systemd/user/ydotoold.service
+systemctl --user daemon-reload
+systemctl --user enable --now ydotoold.service
+```
 
 ## 6. Install The User Service
 
@@ -239,6 +278,28 @@ Tray-specific note:
 - the GTK tray path is used because `pystray` on X11 does not provide a real menu implementation
 - the tray is intended for backend switching and status, not start/stop recording
 - the tray also exposes transcription history entries with copy actions
+
+## Plasma / Wayland Notes
+
+For Plasma/Wayland hosts, the recommended setup is:
+
+- `type_backend: ydotool`
+- a running `ydotoold` user service
+- AppIndicator-capable tray support
+
+Why:
+
+- `xdotool` may trigger KDE remote-control prompts under Wayland
+- `ydotool` avoids the portal path and works better when `/dev/uinput` is available to the user
+
+Repo-provided user service:
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 644 systemd/ydotoold.service ~/.config/systemd/user/ydotoold.service
+systemctl --user daemon-reload
+systemctl --user enable --now ydotoold.service
+```
 
 Recording HUD note:
 

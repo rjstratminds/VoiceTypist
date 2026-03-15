@@ -4,7 +4,7 @@
 
 VoiceTypist is a Linux-first dictation project inspired by [VoiceInk](https://github.com/Beingpax/VoiceInk).
 
-It keeps the same quick toggle-to-dictate workflow, but targets Linux desktops with PipeWire or PulseAudio, X11 text injection, and a global hotkey.
+It keeps the same quick toggle-to-dictate workflow, but targets Linux desktops with PipeWire or PulseAudio, desktop tray integration, configurable text injection, and a global hotkey.
 
 ## What It Does
 
@@ -13,7 +13,7 @@ It keeps the same quick toggle-to-dictate workflow, but targets Linux desktops w
 - Capture audio in memory instead of writing session audio to `/tmp`
 - Run a final transcription pass after the session ends
 - Optionally refine the transcript with Gemini
-- Type the final text into the focused X11 window with `xdotool`
+- Type the final text into the focused app with `ydotool` or `xdotool`
 - Show tray state as `Idle`, `Listening`, or `Refining`
 - Let you switch between `whisper.cpp` and Parakeet from the tray menu
 - Show a live bottom-center recording HUD with waveform-style level bars while dictating
@@ -23,15 +23,17 @@ It keeps the same quick toggle-to-dictate workflow, but targets Linux desktops w
 
 VoiceTypist currently targets Linux desktop sessions with:
 
-- X11 access for text injection and fallback hotkey handling
+- `evdev` access for hotkeys, or X11 access for `pynput` fallback
 - PipeWire or PulseAudio audio capture through `ffmpeg`
 - A working tray implementation if you want status icons
+- Optional `ydotool` for Wayland-friendly text injection
+- Optional CUDA-enabled `whisper.cpp` on NVIDIA hosts
 
-Wayland is not a first-class target in the current codebase. The service can run under GNOME, but successful dictation still depends on X11 connectivity for tray and typing behavior.
+The same codebase is intended to run across both GNOME/X11-style hosts and Plasma/Wayland hosts. In practice that means the app auto-selects different tray and typing backends depending on what the machine provides.
 
 ## Pipeline
 
-`PipeWire/PulseAudio source -> ffmpeg PCM stream -> in-memory buffer -> ASR -> optional Gemini refine -> xdotool type`
+`PipeWire/PulseAudio source -> ffmpeg PCM stream -> in-memory buffer -> ASR -> optional Gemini refine -> ydotool or xdotool type`
 
 Supported ASR backends:
 
@@ -46,7 +48,8 @@ Recommended default:
 ## Quick Start
 
 1. Install system packages:
-   `ffmpeg`, `xdotool`, `python3`, `python3-venv`, and audio/X11 dependencies required by your distro.
+   `ffmpeg`, `python3`, `python3-venv`, and desktop/input dependencies required by your distro.
+   Typical typing packages are `ydotool` for Wayland-capable hosts and `xdotool` for X11 hosts.
 2. Create a virtual environment and install Python requirements:
    `python3 -m venv venv`
    `./venv/bin/pip install -r requirements.txt`
@@ -72,6 +75,8 @@ Current keys:
 - `asr`: `whisper` or `parakeet`
 - `model`: path to the `whisper.cpp` model
 - `whisper_bin`: path to `whisper-cli`
+- `whisper_threads`: thread count passed to `whisper-cli`
+- `type_backend`: `auto`, `ydotool`, or `xdotool`
 - `parakeet_model`: NeMo model name
 - `gemini_model`: Gemini model ID used when `GOOGLE_API_KEY` is present
 - `rewrite_system_prompt`: prompt used for Gemini transcript refinement
@@ -83,6 +88,8 @@ Example:
 asr: whisper
 model: ~/whisper.cpp/models/ggml-small.en.bin
 whisper_bin: ~/whisper.cpp/build/bin/whisper-cli
+whisper_threads: 8
+type_backend: auto
 parakeet_model: nvidia/parakeet-tdt-0.6b-v3
 gemini_model: gemini-2.5-flash-lite
 rewrite_system_prompt: |
@@ -137,12 +144,14 @@ For secret management, prefer a user drop-in with an `EnvironmentFile` rather th
 Backend behavior is materially different:
 
 - `whisper.cpp` is usually the fastest path to a responsive setup on CPU
+- a CUDA-enabled `whisper.cpp` build is the practical speed path on NVIDIA hosts when you do not want the heavier Parakeet runtime
 - Parakeet has a heavier first-use cost because the model loads lazily on the first transcription
 - Parakeet becomes much more competitive when CUDA is working and the model is already resident in memory
 
 In other words:
 
 - fastest setup: Whisper on CPU
+- best practical NVIDIA path with minimal app changes: Whisper on CUDA
 - best chance of faster high-end inference: Parakeet on GPU
 
 ## How Input Works
@@ -159,13 +168,23 @@ Current hotkey behavior:
 - double `Right Alt`: start dictation, or finish and transcribe if already recording
 - double `Right Ctrl`: cancel the current recording without transcription
 
-Typing output currently uses:
+Typing output backends:
 
-- `xdotool type --clearmodifiers`
+- `ydotool` when `type_backend` is `ydotool` or `auto` and the daemon socket is available
+- `xdotool type --clearmodifiers` as fallback when `type_backend` is `auto` or explicitly `xdotool`
+
+Recommended host choices:
+
+- GNOME/X11-style hosts: `type_backend: xdotool` is acceptable
+- Plasma/Wayland hosts: `type_backend: ydotool` avoids KDE remote-control portal prompts
 
 ## Tray Behavior
 
-On this X11/GNOME setup, the tray is implemented with GTK rather than the X11 `pystray` backend, because the `pystray` Xorg backend does not provide real menus.
+Tray backend selection is environment-dependent:
+
+- AppIndicator on Plasma/Wayland or other desktops that expose StatusNotifier/AppIndicator support
+- GTK `StatusIcon` as fallback on GNOME/X11-style setups
+- `pystray` only as a last fallback
 
 Current tray menu actions:
 
@@ -208,12 +227,36 @@ Current behavior:
 
 ## Limitations
 
-- X11 is currently required for reliable text injection
-- Tray behavior depends on your desktop environment and tray support
+- tray behavior still depends on your desktop environment and tray support
+- `ydotool` requires a running `ydotoold` daemon and access to `/dev/uinput`
+- `xdotool` still depends on X11 and may trigger remote-control prompts under Plasma/Wayland
 - The app transcribes after capture ends; it is not a streaming partial-transcript UI
 - Parakeet requires additional heavyweight Python dependencies not listed in `requirements.txt`
 - The first Parakeet transcription after service start is slower because model loading is lazy
 - GPU-enabled Parakeet requires a CUDA-enabled ARM64 PyTorch build on this machine
+
+## Cross-Machine Setup
+
+The current code is intended to stay shared across machines such as:
+
+- `rj-spark`: GNOME-oriented DGX Spark environment
+- `rj-blade`: Plasma 6 / Wayland / NVIDIA laptop environment
+
+The generalization point is config and local packaging, not machine-specific forks.
+
+Shared code handles:
+
+- tray backend auto-selection
+- typing backend selection
+- Whisper thread configuration
+- CUDA-capable Whisper binary paths
+
+Machine-specific configuration should stay in `~/.config/voicetypist-linux/config.yaml`, especially:
+
+- `whisper_bin`
+- `whisper_threads`
+- `type_backend`
+- `audio_source`
 
 ## Inspiration
 

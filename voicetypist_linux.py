@@ -28,6 +28,8 @@ import tempfile
 import threading
 import traceback
 import wave
+import site
+import shutil
 from glob import glob
 from pathlib import Path
 
@@ -44,6 +46,8 @@ DEFAULT_CONFIG = {
     "asr": "whisper",
     "model": "~/whisper.cpp/models/ggml-small.en.bin",
     "whisper_bin": "~/whisper.cpp/build/bin/whisper-cli",
+    "whisper_threads": max(os.cpu_count() or 4, 1),
+    "type_backend": "auto",
     "parakeet_model": "nvidia/parakeet-tdt-0.6b-v3",
     "gemini_model": "gemini-2.5-flash-lite",
     "audio_source": "default",
@@ -57,7 +61,7 @@ DEFAULT_CONFIG = {
 
 HF_HOME = Path.home() / ".cache" / "voicetypist-hf"
 HF_HUB_CACHE = HF_HOME / "hub"
-TRAY_ICON_PATH = HF_HOME / "tray-icon.png"
+TRAY_ICON_DIR = HF_HOME / "tray-icons"
 
 # -----------------------------
 # Utilities
@@ -79,6 +83,7 @@ def current_asr_backend() -> str:
 def ensure_model_cache_env():
     HF_HOME.mkdir(parents=True, exist_ok=True)
     HF_HUB_CACHE.mkdir(parents=True, exist_ok=True)
+    TRAY_ICON_DIR.mkdir(parents=True, exist_ok=True)
     os.environ["HF_HOME"] = str(HF_HOME)
     os.environ["HF_HUB_CACHE"] = str(HF_HUB_CACHE)
     os.environ["HUGGINGFACE_HUB_CACHE"] = str(HF_HUB_CACHE)
@@ -183,6 +188,14 @@ if "model" not in config:
     except Exception:
         config["model"] = "~/whisper.cpp/models/ggml-small.en.bin"
 
+if "whisper_threads" not in config:
+    try:
+        config["whisper_threads"] = int(
+            config.get("whisper", {}).get("threads", DEFAULT_CONFIG["whisper_threads"])
+        )
+    except Exception:
+        config["whisper_threads"] = DEFAULT_CONFIG["whisper_threads"]
+
 if "gemini_model" not in config:
     try:
         config["gemini_model"] = config.get("rewrite", {}).get("model", "gemini-2.5-flash-lite")
@@ -206,6 +219,9 @@ if "audio_source" not in config:
 if "parakeet_model" not in config:
     config["parakeet_model"] = "nvidia/parakeet-tdt-0.6b-v3"
 
+if "type_backend" not in config:
+    config["type_backend"] = "auto"
+
 # -----------------------------
 # ASR
 # -----------------------------
@@ -215,12 +231,15 @@ class WhisperASR:
     def __init__(self):
         self.binary = expand(config["whisper_bin"])
         self.model = expand(config["model"])
+        self.threads = max(int(config.get("whisper_threads", DEFAULT_CONFIG["whisper_threads"])), 1)
 
     def transcribe_file(self, wav_path: str):
         cmd = [
             self.binary,
             "-m",
             self.model,
+            "-t",
+            str(self.threads),
             "-f",
             wav_path,
             "-nt",
@@ -310,7 +329,7 @@ def build_asr():
         log(f"ASR backend: parakeet ({config['parakeet_model']})")
         return ParakeetASR()
 
-    log(f"ASR backend: whisper ({config['model']})")
+    log(f"ASR backend: whisper ({config['model']}, threads={config.get('whisper_threads')})")
     return WhisperASR()
 
 
@@ -322,6 +341,8 @@ tray_icon = None
 tray_lock = threading.Lock()
 pystray = None
 gtk = None
+appindicator = None
+app_indicator = None
 gtk_status_icon = None
 gtk_menu = None
 glib = None
@@ -331,6 +352,7 @@ overlay_area = None
 overlay_levels = []
 overlay_visible = False
 transcription_history = []
+gtk_main_loop_active = False
 
 # -----------------------------
 # Gemini refinement
@@ -375,6 +397,29 @@ def gemini_refine(text: str):
 
 
 def type_text(text):
+    backend = str(config.get("type_backend", "auto")).lower()
+    attempted = []
+
+    if backend in {"auto", "ydotool"}:
+        attempted.append("ydotool")
+        if _type_text_with_ydotool(text):
+            return
+        if backend == "ydotool":
+            return
+
+    if backend in {"auto", "xdotool"}:
+        attempted.append("xdotool")
+        if _type_text_with_xdotool(text):
+            return
+
+    log(f"Typing failed using backends: {', '.join(attempted)}")
+
+
+def _type_text_with_xdotool(text: str) -> bool:
+    if shutil.which("xdotool") is None:
+        log("xdotool unavailable")
+        return False
+
     result = subprocess.run(
         ["xdotool", "type", "--clearmodifiers", text],
         capture_output=True,
@@ -382,8 +427,33 @@ def type_text(text):
     )
     if result.returncode != 0:
         log(f"xdotool type failed: {result.stderr.strip() or result.stdout.strip()}")
-    else:
-        log(f"Typed text ({len(text)} chars)")
+        return False
+
+    log(f"Typed text ({len(text)} chars) via xdotool")
+    return True
+
+
+def _type_text_with_ydotool(text: str) -> bool:
+    if shutil.which("ydotool") is None:
+        log("ydotool unavailable")
+        return False
+
+    socket_path = os.environ.get("YDOTOOL_SOCKET") or str(Path.home() / ".ydotool_socket")
+    env = os.environ.copy()
+    env["YDOTOOL_SOCKET"] = socket_path
+
+    result = subprocess.run(
+        ["ydotool", "type", text],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if result.returncode != 0:
+        log(f"ydotool type failed: {result.stderr.strip() or result.stdout.strip()}")
+        return False
+
+    log(f"Typed text ({len(text)} chars) via ydotool")
+    return True
 
 
 def play_chime(name: str):
@@ -460,9 +530,10 @@ def build_tray_image(state: str):
 
 
 def write_tray_icon(state: str) -> str:
-    HF_HOME.mkdir(parents=True, exist_ok=True)
-    build_tray_image(state).save(TRAY_ICON_PATH)
-    return str(TRAY_ICON_PATH)
+    TRAY_ICON_DIR.mkdir(parents=True, exist_ok=True)
+    icon_path = TRAY_ICON_DIR / f"tray-icon-{state}.png"
+    build_tray_image(state).save(icon_path)
+    return str(icon_path)
 
 
 def history_preview(text: str, limit: int = 44) -> str:
@@ -505,9 +576,10 @@ def copy_text_to_clipboard(text: str):
 
 def refresh_tray():
     global tray_icon
+    global app_indicator
     global gtk_status_icon
 
-    if tray_icon is None and gtk_status_icon is None:
+    if tray_icon is None and app_indicator is None and gtk_status_icon is None:
         return
 
     with tray_lock:
@@ -515,16 +587,35 @@ def refresh_tray():
 
     title = f"VoiceTypist Linux: {_state_label(state)} [{current_asr_backend()}]"
 
-    if gtk_status_icon is not None:
-        gtk_status_icon.set_from_file(write_tray_icon(state))
-        gtk_status_icon.set_tooltip_text(title)
-        rebuild_gtk_menu()
+    if app_indicator is not None or gtk_status_icon is not None:
+        if glib is not None and gtk_main_loop_active:
+            glib.idle_add(_refresh_gtk_tray, state, title)
+        else:
+            _refresh_gtk_tray(state, title)
 
     if tray_icon is not None:
         tray_icon.icon = build_tray_image(state)
         tray_icon.title = title
         tray_icon.menu = build_pystray_menu()
         tray_icon.update_menu()
+
+
+def _refresh_gtk_tray(state: str, title: str):
+    icon_path = write_tray_icon(state)
+
+    if app_indicator is not None:
+        app_indicator.set_icon_full(icon_path, title)
+        app_indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
+        app_indicator.set_menu(gtk_menu)
+
+    if gtk_status_icon is None:
+        rebuild_gtk_menu()
+        return False
+
+    gtk_status_icon.set_from_file(icon_path)
+    gtk_status_icon.set_tooltip_text(title)
+    rebuild_gtk_menu()
+    return False
 
 
 def _overlay_position(width: int, height: int):
@@ -874,33 +965,60 @@ def init_tray():
     global pystray
     global tray_icon
     global gtk
+    global appindicator
+    global app_indicator
     global gdk
     global glib
     global gtk_status_icon
     global gtk_menu
 
     try:
-        if "/usr/lib/python3/dist-packages" not in sys.path:
-            sys.path.append("/usr/lib/python3/dist-packages")
+        pyver = f"{sys.version_info.major}.{sys.version_info.minor}"
+        for candidate in (
+            "/usr/lib/python3/dist-packages",
+            f"/usr/lib/python{pyver}/site-packages",
+            f"/usr/lib64/python{pyver}/site-packages",
+        ):
+            if os.path.isdir(candidate):
+                site.addsitedir(candidate)
         import gi
 
         gi.require_version("Gtk", "3.0")
         from gi.repository import Gtk
         from gi.repository import Gdk
         from gi.repository import GLib
+        try:
+            gi.require_version("AyatanaAppIndicator3", "0.1")
+            from gi.repository import AyatanaAppIndicator3 as AyatanaAppIndicator
+            appindicator = AyatanaAppIndicator
+        except Exception:
+            appindicator = None
 
         gtk = Gtk
         gdk = Gdk
         glib = GLib
+        gtk_menu = Gtk.Menu()
+        rebuild_gtk_menu()
+        init_overlay()
+
+        if appindicator is not None:
+            app_indicator = appindicator.Indicator.new(
+                "voicetypist-linux",
+                write_tray_icon(app_state),
+                appindicator.IndicatorCategory.APPLICATION_STATUS,
+            )
+            app_indicator.set_title("VoiceTypist Linux")
+            app_indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
+            app_indicator.set_menu(gtk_menu)
+            refresh_tray()
+            log("Tray icon started (AppIndicator)")
+            return "gtk"
+
         gtk_status_icon = Gtk.StatusIcon()
         gtk_status_icon.set_visible(True)
         gtk_status_icon.set_title("VoiceTypist Linux")
         gtk_status_icon.set_tooltip_text(f"VoiceTypist Linux: Idle [{current_asr_backend()}]")
         gtk_status_icon.set_from_file(write_tray_icon(app_state))
-
-        gtk_menu = Gtk.Menu()
-        rebuild_gtk_menu()
-        init_overlay()
 
         def popup_menu(icon, button=0, activate_time=0):
             gtk_menu.popup(
@@ -915,12 +1033,12 @@ def init_tray():
         gtk_status_icon.connect("popup-menu", popup_menu)
         gtk_status_icon.connect("activate", lambda icon: popup_menu(icon, 0, Gtk.get_current_event_time()))
 
-        thread = threading.Thread(target=Gtk.main, daemon=True)
-        thread.start()
         log("Tray icon started (GTK)")
-        return
+        return "gtk"
     except Exception as exc:
         gtk = None
+        appindicator = None
+        app_indicator = None
         gtk_status_icon = None
         gtk_menu = None
         log(f"GTK tray unavailable: {exc}")
@@ -939,9 +1057,11 @@ def init_tray():
         thread = threading.Thread(target=tray_icon.run, daemon=True)
         thread.start()
         log("Tray icon started")
+        return "pystray"
     except Exception as exc:
         tray_icon = None
         log(f"Tray unavailable: {exc}")
+        return None
 
 
 class StreamingRecorder:
@@ -1268,9 +1388,11 @@ class AltHotkey:
 
 
 def main():
+    global gtk_main_loop_active
+
     log("VoiceTypist Linux started")
     ensure_x11_display()
-    init_tray()
+    tray_backend = init_tray()
 
     hotkey = AltHotkey()
 
@@ -1278,10 +1400,13 @@ def main():
     t.daemon = True
     t.start()
 
+    if tray_backend == "gtk" and gtk is not None:
+        gtk_main_loop_active = True
+        gtk.main()
+        return
+
     while True:
-        time.sleep(1)  # fixed missing parenthesis previously causing SyntaxError
-            # original code likely truncated
-            # keep loop alive1)
+        time.sleep(1)
 
 
 if __name__ == "__main__":

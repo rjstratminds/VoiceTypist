@@ -25,6 +25,12 @@ The repo service file is designed to inherit those variables through `PassEnviro
 
 If you are on GNOME/X11 and clicking the icon does nothing, check that you are running a build with the GTK tray path. The older `pystray` X11 backend does not expose a useful menu.
 
+If you are on Plasma/Wayland, look for:
+
+- `Tray icon started (AppIndicator)`
+
+If the icon is still missing even though that line appears, the remaining issue is usually desktop-side tray presentation rather than VoiceTypist failing to publish a status item.
+
 ## Hotkey Does Not Work
 
 VoiceTypist tries hotkey backends in this order:
@@ -108,8 +114,9 @@ then ASR finished and the problem is downstream of transcription.
 If the logs show:
 
 - `xdotool type failed: ...`
+- `ydotool type failed: ...`
 
-then the failure is in X11 text injection.
+then the failure is in the selected text injection backend rather than transcription.
 
 ## Recording HUD Does Not Appear
 
@@ -136,22 +143,55 @@ Also note:
 
 ## Text Is Not Typed Into The Focused App
 
-Typing is currently done with:
+Typing may be done with either:
 
 ```bash
-xdotool type --clearmodifiers
+ydotool type ...
+```
+
+or:
+
+```bash
+xdotool type --clearmodifiers ...
 ```
 
 If nothing is typed:
 
-- confirm VoiceTypist can reach X11
-- confirm the target application accepts X11 synthetic input
-- test `xdotool` manually in the same session
+- confirm `type_backend` in `~/.config/voicetypist-linux/config.yaml`
+- if using `ydotool`, confirm `ydotoold.service` is running and `~/.ydotool_socket` exists
+- if using `xdotool`, confirm VoiceTypist can reach X11 and the target app accepts X11 synthetic input
+- test the backend manually in the same session
 
 GNOME-specific note:
 
 - the service can be running correctly while still missing the desktop session environment it needs for tray and typing
 - confirm `DISPLAY` and `XAUTHORITY` are correct in the running process or inherited user `systemd` environment
+
+Plasma-specific note:
+
+- if `xdotool` triggers a KDE remote-control prompt, switch to `type_backend: ydotool`
+- `ydotool` is the tighter fix than pre-authorizing KDE remote-desktop portal permissions
+
+## ydotool Does Not Work
+
+Check:
+
+```bash
+systemctl --user status ydotoold.service --no-pager
+ls -l ~/.ydotool_socket
+```
+
+Common causes:
+
+- `ydotoold.service` is not running
+- the socket path does not match the one VoiceTypist expects
+- the user lacks access to `/dev/uinput`
+
+If needed, test directly:
+
+```bash
+YDOTOOL_SOCKET=$HOME/.ydotool_socket ydotool type "test"
+```
 
 ## Parakeet Backend Fails To Start
 
