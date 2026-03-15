@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 VoiceTypist Linux
+Richard Jhang | @rjstratminds GitHub
 
 Features
 - double-Right-Alt toggle dictation
