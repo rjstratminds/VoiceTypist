@@ -3,6 +3,8 @@
 VoiceTypist Linux
 Richard Jhang | @rjstratminds GitHub
 
+VoiceTypist, inspired by VoiceInk, maintained by Richard Jhang | @rjstratminds
+
 Features
 - double-Right-Alt toggle dictation
 - in-memory PipeWire capture (no session file on disk)
@@ -15,11 +17,13 @@ Features
 from __future__ import annotations
 
 import os
+import sys
 import time
 import json
 import io
 import math
 import subprocess
+import struct
 import tempfile
 import threading
 import traceback
@@ -43,7 +47,17 @@ DEFAULT_CONFIG = {
     "parakeet_model": "nvidia/parakeet-tdt-0.6b-v3",
     "gemini_model": "gemini-2.5-flash-lite",
     "audio_source": "default",
+    "rewrite_system_prompt": (
+        "Refine this transcript to sound native and easy-to-understand in English.\n"
+        "Enhance its flow and clarity, ensuring key points are conveyed accurately\n"
+        "and intuitively without needless repetition.\n\n"
+        "Only give the refined text."
+    ),
 }
+
+HF_HOME = Path.home() / ".cache" / "voicetypist-hf"
+HF_HUB_CACHE = HF_HOME / "hub"
+TRAY_ICON_PATH = HF_HOME / "tray-icon.png"
 
 # -----------------------------
 # Utilities
@@ -56,6 +70,18 @@ def expand(path: str) -> str:
 
 def log(*parts):
     print(*parts, flush=True)
+
+
+def current_asr_backend() -> str:
+    return str(config.get("asr", "whisper")).lower()
+
+
+def ensure_model_cache_env():
+    HF_HOME.mkdir(parents=True, exist_ok=True)
+    HF_HUB_CACHE.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(HF_HOME)
+    os.environ["HF_HUB_CACHE"] = str(HF_HUB_CACHE)
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(HF_HUB_CACHE)
 
 
 def _x11_env(display: str):
@@ -138,6 +164,7 @@ def load_config():
 
 
 config = load_config()
+ensure_model_cache_env()
 
 # Backwards compatibility with older YAML configs
 if "asr" not in config:
@@ -161,6 +188,14 @@ if "gemini_model" not in config:
         config["gemini_model"] = config.get("rewrite", {}).get("model", "gemini-2.5-flash-lite")
     except Exception:
         config["gemini_model"] = "gemini-2.5-flash-lite"
+
+if "rewrite_system_prompt" not in config:
+    try:
+        config["rewrite_system_prompt"] = config.get("rewrite", {}).get(
+            "system_prompt", DEFAULT_CONFIG["rewrite_system_prompt"]
+        )
+    except Exception:
+        config["rewrite_system_prompt"] = DEFAULT_CONFIG["rewrite_system_prompt"]
 
 if "audio_source" not in config:
     try:
@@ -256,9 +291,15 @@ class ParakeetASR:
             result = model.transcribe([path], batch_size=1)
             if not result:
                 return ""
-            if isinstance(result[0], str):
-                return result[0].strip()
-            return str(result[0]).strip()
+            first = result[0]
+            if isinstance(first, str):
+                return first.strip()
+
+            text = getattr(first, "text", None)
+            if isinstance(text, str):
+                return text.strip()
+
+            return str(first).strip()
         finally:
             os.close(fd)
 
@@ -280,6 +321,16 @@ app_state = "idle"
 tray_icon = None
 tray_lock = threading.Lock()
 pystray = None
+gtk = None
+gtk_status_icon = None
+gtk_menu = None
+glib = None
+gdk = None
+overlay_window = None
+overlay_area = None
+overlay_levels = []
+overlay_visible = False
+transcription_history = []
 
 # -----------------------------
 # Gemini refinement
@@ -292,16 +343,8 @@ def gemini_refine(text: str):
     if not api_key:
         return text
 
-    prompt = f"""
-Refine this transcript to sound native and easy-to-understand in English.
-Enhance its flow and clarity, ensuring key points are conveyed accurately
-and intuitively without needless repetition.
-
-Only give the refined text.
-
-Transcript:
-{text}
-"""
+    system_prompt = config.get("rewrite_system_prompt", DEFAULT_CONFIG["rewrite_system_prompt"]).strip()
+    prompt = f"{system_prompt}\n\nTranscript:\n{text}\n"
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{config['gemini_model']}:generateContent?key={api_key}"
 
@@ -332,7 +375,15 @@ Transcript:
 
 
 def type_text(text):
-    subprocess.run(["xdotool", "type", "--clearmodifiers", text])
+    result = subprocess.run(
+        ["xdotool", "type", "--clearmodifiers", text],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        log(f"xdotool type failed: {result.stderr.strip() or result.stdout.strip()}")
+    else:
+        log(f"Typed text ({len(text)} chars)")
 
 
 def play_chime(name: str):
@@ -408,18 +459,230 @@ def build_tray_image(state: str):
     return image
 
 
+def write_tray_icon(state: str) -> str:
+    HF_HOME.mkdir(parents=True, exist_ok=True)
+    build_tray_image(state).save(TRAY_ICON_PATH)
+    return str(TRAY_ICON_PATH)
+
+
+def history_preview(text: str, limit: int = 44) -> str:
+    single_line = " ".join((text or "").split())
+    if len(single_line) <= limit:
+        return single_line
+    return single_line[: limit - 1] + "…"
+
+
+def add_transcription_history(text: str):
+    cleaned = normalize_transcript(text)
+    if not cleaned:
+        return
+    transcription_history.insert(0, cleaned)
+    del transcription_history[10:]
+    refresh_tray()
+
+
+def copy_text_to_clipboard(text: str):
+    try:
+        if gtk is not None and gdk is not None:
+            clipboard = gtk.Clipboard.get(gdk.SELECTION_CLIPBOARD)
+            clipboard.set_text(text, -1)
+            clipboard.store()
+            log(f"Copied transcript ({len(text)} chars)")
+            return
+    except Exception as exc:
+        log(f"GTK clipboard failed: {exc}")
+
+    for cmd in (["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+        try:
+            subprocess.run(cmd, input=text, text=True, check=True, capture_output=True)
+            log(f"Copied transcript ({len(text)} chars)")
+            return
+        except Exception:
+            continue
+
+    log("Clipboard copy unavailable")
+
+
 def refresh_tray():
     global tray_icon
+    global gtk_status_icon
 
-    if tray_icon is None:
+    if tray_icon is None and gtk_status_icon is None:
         return
 
     with tray_lock:
         state = app_state
 
-    tray_icon.icon = build_tray_image(state)
-    tray_icon.title = f"VoiceTypist Linux: {_state_label(state)}"
-    tray_icon.update_menu()
+    title = f"VoiceTypist Linux: {_state_label(state)} [{current_asr_backend()}]"
+
+    if gtk_status_icon is not None:
+        gtk_status_icon.set_from_file(write_tray_icon(state))
+        gtk_status_icon.set_tooltip_text(title)
+        rebuild_gtk_menu()
+
+    if tray_icon is not None:
+        tray_icon.icon = build_tray_image(state)
+        tray_icon.title = title
+        tray_icon.menu = build_pystray_menu()
+        tray_icon.update_menu()
+
+
+def _overlay_position(width: int, height: int):
+    if gdk is None:
+        return (0, 0)
+    screen = gdk.Screen.get_default()
+    if screen is None:
+        return (0, 0)
+    screen_width = screen.get_width()
+    screen_height = screen.get_height()
+    return (
+        max((screen_width - width) // 2, 0),
+        max(screen_height - height - 54, 0),
+    )
+
+
+def _draw_overlay(widget, cr):
+    width = widget.get_allocated_width()
+    height = widget.get_allocated_height()
+
+    cr.set_source_rgba(0.07, 0.09, 0.12, 0.9)
+    cr.rectangle(0, 0, width, height)
+    cr.fill()
+
+    cr.set_source_rgba(1, 1, 1, 0.08)
+    cr.rectangle(1, 1, width - 2, height - 2)
+    cr.stroke()
+
+    cr.select_font_face("Sans", 0, 0)
+    cr.set_font_size(13)
+    cr.set_source_rgba(0.95, 0.97, 0.99, 0.92)
+    cr.move_to(14, 18)
+    cr.show_text("VoiceTypist Listening")
+
+    baseline = height - 18
+    graph_top = 26
+    graph_height = baseline - graph_top
+    bar_width = 4
+    gap = 2
+    start_x = 14
+
+    for index, level in enumerate(overlay_levels[-44:]):
+        x = start_x + index * (bar_width + gap)
+        bar_height = max(6, level * graph_height)
+        y = baseline - bar_height
+
+        if level >= 0.38:
+            cr.set_source_rgba(0.22, 0.82, 0.49, 0.95)
+        elif level >= 0.16:
+            cr.set_source_rgba(0.98, 0.78, 0.20, 0.95)
+        else:
+            cr.set_source_rgba(0.42, 0.56, 0.96, 0.95)
+
+        cr.rectangle(x, y, bar_width, bar_height)
+        cr.fill()
+
+    current = overlay_levels[-1] if overlay_levels else 0.0
+    meter_width = 58
+    meter_height = 8
+    meter_x = width - meter_width - 14
+    meter_y = 11
+
+    cr.set_source_rgba(1, 1, 1, 0.14)
+    cr.rectangle(meter_x, meter_y, meter_width, meter_height)
+    cr.fill()
+
+    if current >= 0.38:
+        cr.set_source_rgba(0.22, 0.82, 0.49, 0.95)
+    elif current >= 0.16:
+        cr.set_source_rgba(0.98, 0.78, 0.20, 0.95)
+    else:
+        cr.set_source_rgba(0.42, 0.56, 0.96, 0.95)
+    cr.rectangle(meter_x, meter_y, max(current * meter_width, 2), meter_height)
+    cr.fill()
+
+    cr.set_font_size(10)
+    cr.set_source_rgba(0.75, 0.80, 0.86, 0.9)
+    cr.move_to(meter_x, meter_y + 21)
+    cr.show_text("level")
+
+    cr.move_to(14, height - 6)
+    cr.show_text("Right Alt x2 stop   Right Ctrl x2 cancel")
+
+
+def init_overlay():
+    global overlay_window
+    global overlay_area
+
+    if gtk is None or overlay_window is not None:
+        return
+
+    overlay_window = gtk.Window(type=gtk.WindowType.POPUP)
+    overlay_window.set_decorated(False)
+    overlay_window.set_keep_above(True)
+    overlay_window.set_skip_taskbar_hint(True)
+    overlay_window.set_skip_pager_hint(True)
+    overlay_window.set_accept_focus(False)
+    overlay_window.set_resizable(False)
+    overlay_window.set_default_size(292, 74)
+    overlay_window.set_type_hint(gdk.WindowTypeHint.NOTIFICATION)
+
+    overlay_area = gtk.DrawingArea()
+    overlay_area.set_size_request(292, 74)
+    overlay_area.connect("draw", _draw_overlay)
+    overlay_window.add(overlay_area)
+    overlay_window.realize()
+    overlay_window.hide()
+
+
+def _show_overlay():
+    global overlay_visible
+
+    if overlay_window is None:
+        return False
+
+    width = 292
+    height = 74
+    x, y = _overlay_position(width, height)
+    overlay_window.move(x, y)
+    overlay_window.show_all()
+    overlay_visible = True
+    return False
+
+
+def _hide_overlay():
+    global overlay_visible
+
+    if overlay_window is not None:
+        overlay_window.hide()
+    overlay_visible = False
+    return False
+
+
+def show_overlay():
+    if gtk is None or glib is None:
+        return
+    glib.idle_add(_show_overlay)
+
+
+def hide_overlay():
+    if gtk is None or glib is None:
+        return
+    glib.idle_add(_hide_overlay)
+
+
+def _push_overlay_level(level: float):
+    if overlay_area is None:
+        return False
+    overlay_levels.append(max(0.0, min(level, 1.0)))
+    del overlay_levels[:-44]
+    overlay_area.queue_draw()
+    return False
+
+
+def push_overlay_level(level: float):
+    if gtk is None or glib is None:
+        return
+    glib.idle_add(_push_overlay_level, level)
 
 
 def set_state(state: str):
@@ -429,10 +692,57 @@ def set_state(state: str):
         app_state = state
 
     refresh_tray()
+    if state == "listening":
+        show_overlay()
+    else:
+        hide_overlay()
 
 
-def tray_toggle(icon=None, item=None):
-    toggle_recording()
+def save_config():
+    import yaml
+
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        yaml.safe_dump(config, f, sort_keys=False)
+
+
+def restart_service():
+    def _restart():
+        try:
+            subprocess.Popen(
+                ["systemctl", "--user", "restart", "voicetypist.service"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            log(f"Failed to restart service: {exc}")
+
+    threading.Thread(target=_restart, daemon=True).start()
+
+
+def switch_backend(backend: str):
+    backend = backend.lower()
+    if backend not in {"whisper", "parakeet"}:
+        return
+    if current_asr_backend() == backend:
+        return
+
+    config["asr"] = backend
+    save_config()
+    log(f"Switching backend to {backend}")
+    restart_service()
+
+
+def tray_use_whisper(icon=None, item=None):
+    switch_backend("whisper")
+
+
+def tray_use_parakeet(icon=None, item=None):
+    switch_backend("parakeet")
+
+
+def tray_copy_history_entry(text: str):
+    copy_text_to_clipboard(text)
 
 
 def tray_quit(icon=None, item=None):
@@ -446,12 +756,174 @@ def tray_quit(icon=None, item=None):
     if tray_icon is not None:
         tray_icon.stop()
 
+    if gtk is not None:
+        gtk.main_quit()
+
     raise SystemExit(0)
+
+
+def build_gtk_history_menu():
+    history_menu = gtk.Menu()
+
+    if not transcription_history:
+        empty_item = gtk.MenuItem.new_with_label("No transcriptions yet")
+        empty_item.set_sensitive(False)
+        history_menu.append(empty_item)
+        history_menu.show_all()
+        return history_menu
+
+    for index, text in enumerate(transcription_history, start=1):
+        label = f"{index}. {history_preview(text)}"
+        item = gtk.MenuItem.new_with_label(label)
+        submenu = gtk.Menu()
+
+        copy_item = gtk.MenuItem.new_with_label("Copy")
+        copy_item.connect("activate", lambda _, entry=text: tray_copy_history_entry(entry))
+        submenu.append(copy_item)
+
+        full_item = gtk.MenuItem.new_with_label(text if len(text) <= 120 else text[:117] + "…")
+        full_item.set_sensitive(False)
+        submenu.append(full_item)
+
+        submenu.show_all()
+        item.set_submenu(submenu)
+        history_menu.append(item)
+
+    history_menu.show_all()
+    return history_menu
+
+
+def rebuild_gtk_menu():
+    global gtk_menu
+
+    if gtk is None or gtk_menu is None:
+        return
+
+    for child in gtk_menu.get_children():
+        gtk_menu.remove(child)
+
+    whisper_item = gtk.CheckMenuItem.new_with_label("Use Whisper")
+    whisper_item.set_draw_as_radio(True)
+    whisper_item.set_active(current_asr_backend() == "whisper")
+    whisper_item.connect("activate", lambda _: tray_use_whisper())
+    gtk_menu.append(whisper_item)
+
+    parakeet_item = gtk.CheckMenuItem.new_with_label("Use Parakeet")
+    parakeet_item.set_draw_as_radio(True)
+    parakeet_item.set_active(current_asr_backend() == "parakeet")
+    parakeet_item.connect("activate", lambda _: tray_use_parakeet())
+    gtk_menu.append(parakeet_item)
+
+    history_item = gtk.MenuItem.new_with_label("Transcription History")
+    history_item.set_submenu(build_gtk_history_menu())
+    gtk_menu.append(history_item)
+
+    gtk_menu.append(gtk.SeparatorMenuItem())
+
+    quit_item = gtk.MenuItem.new_with_label("Quit")
+    quit_item.connect("activate", lambda _: tray_quit())
+    gtk_menu.append(quit_item)
+
+    gtk_menu.show_all()
+
+
+def build_pystray_history_menu():
+    if not transcription_history:
+        return pystray.Menu(
+            pystray.MenuItem("No transcriptions yet", None, enabled=False)
+        )
+
+    items = []
+    for index, text in enumerate(transcription_history, start=1):
+        label = f"{index}. {history_preview(text)}"
+        items.append(
+            pystray.MenuItem(
+                label,
+                pystray.Menu(
+                    pystray.MenuItem(
+                        "Copy",
+                        lambda icon, item, entry=text: tray_copy_history_entry(entry),
+                    ),
+                    pystray.MenuItem(text if len(text) <= 120 else text[:117] + "…", None, enabled=False),
+                ),
+            )
+        )
+    return pystray.Menu(*items)
+
+
+def build_pystray_menu():
+    return pystray.Menu(
+        pystray.MenuItem(
+            "Use Whisper",
+            tray_use_whisper,
+            checked=lambda item: current_asr_backend() == "whisper",
+            radio=True,
+        ),
+        pystray.MenuItem(
+            "Use Parakeet",
+            tray_use_parakeet,
+            checked=lambda item: current_asr_backend() == "parakeet",
+            radio=True,
+        ),
+        pystray.MenuItem("Transcription History", build_pystray_history_menu()),
+        pystray.MenuItem("Quit", tray_quit),
+    )
 
 
 def init_tray():
     global pystray
     global tray_icon
+    global gtk
+    global gdk
+    global glib
+    global gtk_status_icon
+    global gtk_menu
+
+    try:
+        if "/usr/lib/python3/dist-packages" not in sys.path:
+            sys.path.append("/usr/lib/python3/dist-packages")
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk
+        from gi.repository import Gdk
+        from gi.repository import GLib
+
+        gtk = Gtk
+        gdk = Gdk
+        glib = GLib
+        gtk_status_icon = Gtk.StatusIcon()
+        gtk_status_icon.set_visible(True)
+        gtk_status_icon.set_title("VoiceTypist Linux")
+        gtk_status_icon.set_tooltip_text(f"VoiceTypist Linux: Idle [{current_asr_backend()}]")
+        gtk_status_icon.set_from_file(write_tray_icon(app_state))
+
+        gtk_menu = Gtk.Menu()
+        rebuild_gtk_menu()
+        init_overlay()
+
+        def popup_menu(icon, button=0, activate_time=0):
+            gtk_menu.popup(
+                None,
+                None,
+                Gtk.StatusIcon.position_menu,
+                icon,
+                button,
+                activate_time,
+            )
+
+        gtk_status_icon.connect("popup-menu", popup_menu)
+        gtk_status_icon.connect("activate", lambda icon: popup_menu(icon, 0, Gtk.get_current_event_time()))
+
+        thread = threading.Thread(target=Gtk.main, daemon=True)
+        thread.start()
+        log("Tray icon started (GTK)")
+        return
+    except Exception as exc:
+        gtk = None
+        gtk_status_icon = None
+        gtk_menu = None
+        log(f"GTK tray unavailable: {exc}")
 
     try:
         import pystray as pystray_module
@@ -460,11 +932,8 @@ def init_tray():
         tray_icon = pystray.Icon(
             "voicetypist-linux",
             build_tray_image(app_state),
-            "VoiceTypist Linux: Idle",
-            menu=pystray.Menu(
-                pystray.MenuItem("Toggle Recording", tray_toggle, default=True),
-                pystray.MenuItem("Quit", tray_quit),
-            ),
+            f"VoiceTypist Linux: Idle [{current_asr_backend()}]",
+            menu=build_pystray_menu(),
         )
 
         thread = threading.Thread(target=tray_icon.run, daemon=True)
@@ -520,6 +989,19 @@ class StreamingRecorder:
                 break
             with self.lock:
                 self.buffer.extend(chunk)
+            push_overlay_level(self._chunk_level(chunk))
+
+    def _chunk_level(self, chunk: bytes) -> float:
+        if not chunk:
+            return 0.0
+
+        sample_count = len(chunk) // 2
+        if sample_count <= 0:
+            return 0.0
+
+        samples = struct.unpack("<%dh" % sample_count, chunk[: sample_count * 2])
+        peak = max(abs(sample) for sample in samples)
+        return min(peak / 12000.0, 1.0)
 
     def snapshot(self) -> bytes:
         with self.lock:
@@ -546,6 +1028,7 @@ class LiveDictationSession:
         self.recorder = StreamingRecorder()
 
     def start(self):
+        overlay_levels.clear()
         self.recorder.start()
         set_state("listening")
         play_chime("start")
@@ -555,18 +1038,28 @@ class LiveDictationSession:
         pcm = self.recorder.stop()
         play_chime("stop")
         set_state("processing")
-        transcript = normalize_transcript(asr.transcribe_pcm(pcm))
-        log("Final transcript:", transcript)
-        if not transcript:
-            log("Transcript empty; skipping refinement and typing")
-            set_state("idle")
-            return
+        try:
+            transcript = normalize_transcript(asr.transcribe_pcm(pcm))
+            log("Final transcript:", transcript)
+            if not transcript:
+                log("Transcript empty; skipping refinement and typing")
+                return
 
-        refined = normalize_transcript(gemini_refine(transcript))
-        log("Refined transcript:", refined)
-        if refined:
-            type_text(refined)
+            refined = normalize_transcript(gemini_refine(transcript))
+            log("Refined transcript:", refined)
+            if refined:
+                add_transcription_history(refined)
+                type_text(refined)
+        except Exception as exc:
+            log(f"Transcription failed: {exc}")
+            traceback.print_exc()
+        finally:
+            set_state("idle")
+
+    def cancel(self):
+        self.recorder.stop()
         set_state("idle")
+        log("Recording cancelled")
 
 
 record_session = None
@@ -575,13 +1068,35 @@ record_session = None
 def toggle_recording():
     global record_session
 
-    if record_session is None:
-        record_session = LiveDictationSession()
-        record_session.start()
-    else:
+    try:
+        if record_session is None:
+            record_session = LiveDictationSession()
+            record_session.start()
+        else:
+            session = record_session
+            record_session = None
+            session.stop()
+    except Exception:
+        record_session = None
+        set_state("idle")
+        log("Toggle recording failed")
+        traceback.print_exc()
+
+
+def cancel_recording():
+    global record_session
+
+    try:
+        if record_session is None:
+            return
         session = record_session
         record_session = None
-        session.stop()
+        session.cancel()
+    except Exception:
+        record_session = None
+        set_state("idle")
+        log("Cancel recording failed")
+        traceback.print_exc()
 
 
 # -----------------------------
@@ -594,16 +1109,25 @@ import evdev
 
 class HotkeyBase:
     def __init__(self):
-        self.last = 0.0
+        self.last_toggle = 0.0
+        self.last_cancel = 0.0
         self.window = 0.35
 
-    def trigger(self):
+    def trigger_toggle(self):
         now = time.time()
-        if now - self.last < self.window:
+        if now - self.last_toggle < self.window:
             toggle_recording()
-            self.last = 0.0
+            self.last_toggle = 0.0
         else:
-            self.last = now
+            self.last_toggle = now
+
+    def trigger_cancel(self):
+        now = time.time()
+        if now - self.last_cancel < self.window:
+            cancel_recording()
+            self.last_cancel = 0.0
+        else:
+            self.last_cancel = now
 
 
 class EvdevAltHotkey(HotkeyBase):
@@ -662,7 +1186,12 @@ class EvdevAltHotkey(HotkeyBase):
                 key_event.scancode == evdev.ecodes.KEY_RIGHTALT
                 and key_event.keystate == key_event.key_down
             ):
-                self.trigger()
+                self.trigger_toggle()
+            elif (
+                key_event.scancode == evdev.ecodes.KEY_RIGHTCTRL
+                and key_event.keystate == key_event.key_down
+            ):
+                self.trigger_cancel()
 
 
 class PynputAltHotkey(HotkeyBase):
@@ -674,9 +1203,19 @@ class PynputAltHotkey(HotkeyBase):
         self.listener = keyboard.Listener(on_press=self.on_press)
         log("Hotkey backend: pynput")
 
+    def _is_ctrl_cancel_key(self, key) -> bool:
+        if key in (self.keyboard.Key.ctrl_r, self.keyboard.Key.ctrl):
+            return True
+
+        key_text = str(key).lower()
+        return "ctrl_r" in key_text or key_text == "key.ctrl"
+
     def on_press(self, key):
         if key in (self.keyboard.Key.alt_r, self.keyboard.Key.alt_gr):
-            self.trigger()
+            self.trigger_toggle()
+        elif self._is_ctrl_cancel_key(key):
+            log(f"Cancel hotkey keypress: {key}")
+            self.trigger_cancel()
 
     def run(self):
         self.listener.start()

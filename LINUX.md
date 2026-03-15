@@ -1,65 +1,269 @@
 # VoiceTypist Linux
 
-This directory contains the Linux dictation package for VoiceTypist.
+This repository is a Linux-focused dictation package modeled after VoiceInk's interaction style.
 
-VoiceTypist is inspired by VoiceInk's product feel and interaction model, but this fork is intended for Linux rather than macOS.
+The implementation is intentionally simple:
 
-## Current Behavior
+- one Python entry point
+- one user `systemd` service
+- local audio capture
+- local or in-process ASR
+- optional cloud-side transcript refinement
+- X11 text injection
+- GTK tray menu for backend switching on X11/GNOME
+- bottom-center GTK recording HUD
 
-- Double-tap Right Alt to start a dictation session.
-- While the microphone is live, the tray icon shows `Listening` in red.
-- Double-tap Right Alt again to end the session.
-- The app then runs ASR on the in-memory recording, optionally refines the transcript with Gemini, and types the final text into the focused X11 window.
-- During post-processing, the tray icon shows `Refining` in blue.
-- When idle, the tray icon shows `Idle` in gray.
+## Runtime Flow
 
-## Audio Path
+### 1. Startup
 
-The Linux clone now captures audio in memory instead of writing a session recording to `/tmp`.
+`voicetypist_linux.py` performs these steps:
 
-Pipeline:
+1. Load config from `~/.config/voicetypist-linux/config.yaml`
+2. Fall back to `~/.config/voiceink-linux/config.yaml` if needed
+3. Build the selected ASR backend
+4. Detect a usable X11 display
+5. Start the tray icon if available
+6. Start the global hotkey listener
 
-`PipeWire/PulseAudio source -> ffmpeg stdout PCM stream -> in-memory buffer -> ASR -> Gemini refine -> xdotool type`
+### 2. Toggle Dictation
 
-This keeps the session flow close to VoiceInk toggle mode while staying Linux-native.
+The hotkey is a double-press of Right Alt within a short window.
 
-Supported ASR backends:
+On start:
 
-- `whisper.cpp`
-- `nvidia/parakeet-tdt-0.6b-v3`
+- the recorder launches `ffmpeg`
+- raw 16 kHz mono PCM is buffered in memory
+- tray state changes to `Listening`
+- a bottom-center recording HUD becomes visible
+- a start chime is played
 
-For `whisper.cpp`, the script satisfies the CLI's file-path requirement with an anonymous in-memory file descriptor rather than a temporary recording file on disk.
+On stop:
 
-## Hotkey Backend
+- `ffmpeg` terminates
+- the in-memory PCM buffer is finalized
+- tray state changes to `Refining`
+- the selected ASR backend transcribes the capture
+- Gemini optionally rewrites the final transcript
+- `xdotool` types the result into the focused X11 window
+- tray state returns to `Idle`
 
-Hotkey detection prefers `evdev`. If no readable input device is available, the app falls back to `pynput` against the active X11 session.
+On cancel:
 
-Typical startup logs:
+- the current in-memory capture is discarded
+- no transcription runs
+- the recording HUD hides
+- tray state returns to `Idle`
 
-- `Using X11 display :1`
-- `Tray icon started`
-- `Hotkey backend: evdev on /dev/input/...`
-- `Hotkey backend: pynput`
+Backend switching is separate from recording:
 
-## Config
+- the tray menu can switch between Whisper and Parakeet
+- switching writes the config file and restarts the user service
+- recording itself is still controlled by the hotkey path
+- double `Right Ctrl` cancels the active recording
 
-Config lives at `~/.config/voicetypist-linux/config.yaml`.
+## Components
 
-The script will also read the legacy `~/.config/voiceink-linux/config.yaml` path if it exists.
+### Recorder
 
-Current keys:
+Audio capture is handled by `StreamingRecorder`, which runs:
 
+```text
+ffmpeg -f pulse -i <audio_source> -ac 1 -ar 16000 -f s16le -acodec pcm_s16le pipe:1
+```
+
+The process writes PCM bytes to stdout. VoiceTypist buffers that stream in memory until the session ends.
+
+The same PCM stream is also sampled to drive the live level HUD while recording.
+
+### ASR Backends
+
+#### Whisper
+
+The `whisper` backend shells out to `whisper-cli`.
+
+To avoid writing a session WAV file to disk, VoiceTypist:
+
+1. wraps PCM bytes into an in-memory WAV
+2. places that WAV into an anonymous memfd
+3. passes `/proc/<pid>/fd/<fd>` to `whisper-cli`
+
+#### Parakeet
+
+The `parakeet` backend uses NVIDIA NeMo directly from Python.
+
+Model loading is lazy. The model is loaded only on first transcription request, then kept in memory.
+
+Current implementation details:
+
+- model cache is forced to `~/.cache/voicetypist-hf`
+- if CUDA-enabled PyTorch is available, the model is moved to `cuda`
+- otherwise it falls back to `cpu`
+- NeMo `Hypothesis` objects are normalized to plain text before refinement and typing
+
+## Transcript Refinement
+
+If `GOOGLE_API_KEY` is set, the final transcript is sent to the configured Gemini model with the configured rewrite prompt.
+
+Prompt source precedence:
+
+1. `rewrite_system_prompt`
+2. legacy `rewrite.system_prompt`
+3. built-in default prompt
+
+If the API key is missing or the request fails, VoiceTypist falls back to the unrefined transcript.
+
+## Output Injection
+
+Text output is currently implemented with:
+
+```text
+xdotool type --clearmodifiers
+```
+
+That makes X11 connectivity a hard requirement for successful typing in the current implementation.
+
+## Tray State Model
+
+State values used internally:
+
+- `idle`
+- `listening`
+- `processing`
+
+User-visible labels:
+
+- `Idle`
+- `Listening`
+- `Refining`
+
+Color mapping:
+
+- idle: gray
+- listening: red
+- processing: blue
+
+On this machine, the practical tray backend is GTK `StatusIcon`.
+
+Why:
+
+- the X11 `pystray` backend does not implement real menus
+- GTK gives a clickable menu for backend switching under GNOME/X11
+
+Current tray menu actions:
+
+- `Use Whisper`
+- `Use Parakeet`
+- `Transcription History`
+- `Quit`
+
+History behavior:
+
+- stores the last 10 finalized transcriptions in memory
+- newest first
+- each item exposes a copy action
+- cancelled recordings are not stored
+
+## Hotkey Backends
+
+### Preferred: `evdev`
+
+`evdev` is attempted first because it can read directly from input devices and does not require an X11 keyboard hook.
+
+Selection behavior:
+
+- enumerate `/dev/input/event*`
+- prefer devices that expose `KEY_RIGHTALT`
+- prefer keyboard-like device names where possible
+
+### Fallback: `pynput`
+
+If `evdev` is unavailable, VoiceTypist falls back to `pynput`.
+
+That fallback requires:
+
+- a working X11 session
+- valid `DISPLAY`
+- valid `XAUTHORITY`
+
+If both backends fail, the app stays alive but logs why hotkeys are disabled.
+
+The current `pynput` path also handles:
+
+- double `Right Alt` for toggle
+- double `Right Ctrl` for cancel
+
+## Desktop Session Requirements
+
+The user service should inherit these environment variables from the active desktop session:
+
+- `DISPLAY`
+- `WAYLAND_DISPLAY`
+- `XAUTHORITY`
+- `XDG_CURRENT_DESKTOP`
+- `XDG_SESSION_TYPE`
+- `DBUS_SESSION_BUS_ADDRESS`
+- `GOOGLE_API_KEY` if Gemini refinement is enabled
+
+Without them, the most common failures are:
+
+- tray creation errors
+- `pynput` startup failures
+- inability to type into focused applications
+
+## Config Reference
+
+Current config keys:
+
+- `asr`
 - `model`
 - `whisper_bin`
 - `parakeet_model`
 - `gemini_model`
+- `rewrite_system_prompt`
 - `audio_source`
-- `asr`
 
-`audio_source` defaults to `default`. If transcription is empty or clearly using the wrong microphone, point this at a specific PipeWire/PulseAudio source name.
+Notes:
 
-## Notes
+- `audio_source` defaults to `default`
+- older nested config layouts are still partially supported for compatibility
+- if no config exists, a default one is written on first launch
+- a dedicated Hugging Face cache is configured at `~/.cache/voicetypist-hf`
 
-- The tray icon relies on X11 desktop tray support.
-- Text injection currently uses `xdotool`.
-- The script is optimized for toggle dictation: capture first, transcribe and refine after the session ends.
+## Logging
+
+Typical healthy startup log lines:
+
+- `ASR backend: whisper (...)`
+- `VoiceTypist Linux started`
+- `Using X11 display :1`
+- `Tray icon started`
+- `Hotkey backend: evdev on /dev/input/...`
+
+Healthy GNOME/X11 fallback logs may instead show:
+
+- `Hotkey backend: pynput`
+
+Tray startup may show:
+
+- `Tray icon started (GTK)`
+
+Typical healthy Parakeet logs after the first transcription include:
+
+- `Model EncDecRNNTBPEModel was successfully restored from ...`
+- `Parakeet model loaded on cuda: nvidia/parakeet-tdt-0.6b-v3`
+
+If CUDA is not available, the same line will report `cpu` instead.
+
+Recent builds also log:
+
+- `Typed text (N chars)` on successful X11 injection
+- `xdotool type failed: ...` when typing fails
+
+## Known Constraints
+
+- The app performs final-pass transcription after capture ends, not live streaming transcription
+- Typing is X11-based
+- Tray support depends on desktop shell integration
+- Parakeet setup is intentionally not bundled into the lightweight default requirements
+- The first Parakeet transcription after service start is slower because model loading is lazy
