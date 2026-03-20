@@ -61,7 +61,15 @@ Important behavior note:
 - the tray no longer starts or stops recording
 - recording is still driven by the hotkey path
 - the tray is used for backend switching between Whisper and Parakeet
-- double `Right Ctrl` is used to cancel the active recording without transcription
+- the cancel key behavior is controlled by `cancel_key` and `cancel_press_mode`
+
+If a remapper such as Toshy changes which physical key arrives as Linux `Alt`, set:
+
+```yaml
+toggle_key: alt_any
+```
+
+instead of assuming `alt_r`.
 
 ## Dictation Uses The Wrong Microphone
 
@@ -192,6 +200,28 @@ If needed, test directly:
 ```bash
 YDOTOOL_SOCKET=$HOME/.ydotool_socket ydotool type "test"
 ```
+
+## Toggle Key Does Not Work
+
+Check your configured hotkey fields in:
+
+```text
+~/.config/voicetypist-linux/config.yaml
+```
+
+Relevant keys:
+
+- `toggle_key`
+- `toggle_press_mode`
+- `cancel_key`
+- `cancel_press_mode`
+
+If you use Toshy or another virtual keyboard remapper:
+
+- check the VoiceTypist logs for which `evdev` device was selected
+- if it shows a virtual keyboard, that is expected
+- prefer `toggle_key: alt_any` if the remapper makes `alt_r` unreliable
+- use `toggle_press_mode: single` if you want one press to start and one press to stop
 
 ## Parakeet Backend Fails To Start
 

@@ -48,6 +48,10 @@ DEFAULT_CONFIG = {
     "whisper_bin": "~/whisper.cpp/build/bin/whisper-cli",
     "whisper_threads": max(os.cpu_count() or 4, 1),
     "type_backend": "auto",
+    "toggle_key": "alt_r",
+    "toggle_press_mode": "double",
+    "cancel_key": "ctrl_r",
+    "cancel_press_mode": "double",
     "parakeet_model": "nvidia/parakeet-tdt-0.6b-v3",
     "gemini_model": "gemini-2.5-flash-lite",
     "audio_source": "default",
@@ -221,6 +225,18 @@ if "parakeet_model" not in config:
 
 if "type_backend" not in config:
     config["type_backend"] = "auto"
+
+if "toggle_key" not in config:
+    config["toggle_key"] = DEFAULT_CONFIG["toggle_key"]
+
+if "toggle_press_mode" not in config:
+    config["toggle_press_mode"] = DEFAULT_CONFIG["toggle_press_mode"]
+
+if "cancel_key" not in config:
+    config["cancel_key"] = DEFAULT_CONFIG["cancel_key"]
+
+if "cancel_press_mode" not in config:
+    config["cancel_press_mode"] = DEFAULT_CONFIG["cancel_press_mode"]
 
 # -----------------------------
 # ASR
@@ -454,6 +470,34 @@ def _type_text_with_ydotool(text: str) -> bool:
 
     log(f"Typed text ({len(text)} chars) via ydotool")
     return True
+
+
+def toggle_key_name() -> str:
+    return str(config.get("toggle_key", DEFAULT_CONFIG["toggle_key"])).lower()
+
+
+def cancel_key_name() -> str:
+    return str(config.get("cancel_key", DEFAULT_CONFIG["cancel_key"])).lower()
+
+
+def _press_mode(name: str) -> str:
+    mode = str(config.get(name, DEFAULT_CONFIG[name])).lower()
+    if mode not in {"single", "double"}:
+        return "double"
+    return mode
+
+
+def _evdev_codes_for_key(name: str):
+    mapping = {
+        "alt_l": {evdev.ecodes.KEY_LEFTALT},
+        "alt_r": {evdev.ecodes.KEY_RIGHTALT},
+        "alt_gr": {evdev.ecodes.KEY_RIGHTALT},
+        "alt_any": {evdev.ecodes.KEY_LEFTALT, evdev.ecodes.KEY_RIGHTALT},
+        "ctrl_l": {evdev.ecodes.KEY_LEFTCTRL},
+        "ctrl_r": {evdev.ecodes.KEY_RIGHTCTRL},
+        "ctrl_any": {evdev.ecodes.KEY_LEFTCTRL, evdev.ecodes.KEY_RIGHTCTRL},
+    }
+    return mapping.get(name, set())
 
 
 def play_chime(name: str):
@@ -697,7 +741,7 @@ def _draw_overlay(widget, cr):
     cr.show_text("level")
 
     cr.move_to(14, height - 6)
-    cr.show_text("Right Alt x2 stop   Right Ctrl x2 cancel")
+    cr.show_text("Toggle key stop   Cancel key cancel")
 
 
 def init_overlay():
@@ -1232,8 +1276,14 @@ class HotkeyBase:
         self.last_toggle = 0.0
         self.last_cancel = 0.0
         self.window = 0.35
+        self.toggle_mode = _press_mode("toggle_press_mode")
+        self.cancel_mode = _press_mode("cancel_press_mode")
 
     def trigger_toggle(self):
+        if self.toggle_mode == "single":
+            toggle_recording()
+            return
+
         now = time.time()
         if now - self.last_toggle < self.window:
             toggle_recording()
@@ -1242,6 +1292,10 @@ class HotkeyBase:
             self.last_toggle = now
 
     def trigger_cancel(self):
+        if self.cancel_mode == "single":
+            cancel_recording()
+            return
+
         now = time.time()
         if now - self.last_cancel < self.window:
             cancel_recording()
@@ -1256,12 +1310,12 @@ class EvdevAltHotkey(HotkeyBase):
         self.dev = self._select_device()
         log(f"Hotkey backend: evdev on {self.dev.path} ({self.dev.name})")
 
-    def _supports_right_alt(self, device):
+    def _supports_key(self, device, key_name: str):
         try:
             keys = device.capabilities().get(evdev.ecodes.EV_KEY, [])
         except OSError:
             return False
-        return evdev.ecodes.KEY_RIGHTALT in keys
+        return any(code in keys for code in _evdev_codes_for_key(key_name))
 
     def _select_device(self):
         devices = []
@@ -1278,39 +1332,36 @@ class EvdevAltHotkey(HotkeyBase):
             raise RuntimeError(detail)
 
         keyboards = []
-        right_alt_devices = []
+        preferred_devices = []
 
         for device in devices:
             name = (device.name or "").lower()
             if "keyboard" in name or "kbd" in name:
                 keyboards.append(device)
-            if self._supports_right_alt(device):
-                right_alt_devices.append(device)
+            if self._supports_key(device, toggle_key_name()):
+                preferred_devices.append(device)
 
-        for candidate in right_alt_devices:
+        for candidate in preferred_devices:
             if candidate in keyboards:
                 return candidate
-        if right_alt_devices:
-            return right_alt_devices[0]
+        if preferred_devices:
+            return preferred_devices[0]
         if keyboards:
             return keyboards[0]
         return devices[0]
 
     def run(self):
+        toggle_codes = _evdev_codes_for_key(toggle_key_name())
+        cancel_codes = _evdev_codes_for_key(cancel_key_name())
+
         for event in self.dev.read_loop():
             if event.type != evdev.ecodes.EV_KEY:
                 continue
 
             key_event = evdev.categorize(event)
-            if (
-                key_event.scancode == evdev.ecodes.KEY_RIGHTALT
-                and key_event.keystate == key_event.key_down
-            ):
+            if key_event.scancode in toggle_codes and key_event.keystate == key_event.key_down:
                 self.trigger_toggle()
-            elif (
-                key_event.scancode == evdev.ecodes.KEY_RIGHTCTRL
-                and key_event.keystate == key_event.key_down
-            ):
+            elif key_event.scancode in cancel_codes and key_event.keystate == key_event.key_down:
                 self.trigger_cancel()
 
 
@@ -1323,17 +1374,43 @@ class PynputAltHotkey(HotkeyBase):
         self.listener = keyboard.Listener(on_press=self.on_press)
         log("Hotkey backend: pynput")
 
-    def _is_ctrl_cancel_key(self, key) -> bool:
-        if key in (self.keyboard.Key.ctrl_r, self.keyboard.Key.ctrl):
-            return True
-
+    def _matches_toggle_key(self, key) -> bool:
+        key_name = toggle_key_name()
         key_text = str(key).lower()
-        return "ctrl_r" in key_text or key_text == "key.ctrl"
+
+        if key_name == "alt_l":
+            return key == self.keyboard.Key.alt_l or "alt_l" in key_text
+        if key_name in {"alt_r", "alt_gr"}:
+            return key in (self.keyboard.Key.alt_r, self.keyboard.Key.alt_gr) or "alt_r" in key_text
+        if key_name == "alt_any":
+            return key in (
+                self.keyboard.Key.alt,
+                self.keyboard.Key.alt_l,
+                self.keyboard.Key.alt_r,
+                self.keyboard.Key.alt_gr,
+            ) or "alt" in key_text
+        return False
+
+    def _matches_cancel_key(self, key) -> bool:
+        key_name = cancel_key_name()
+        key_text = str(key).lower()
+
+        if key_name == "ctrl_l":
+            return key == self.keyboard.Key.ctrl_l or "ctrl_l" in key_text
+        if key_name == "ctrl_r":
+            return key == self.keyboard.Key.ctrl_r or "ctrl_r" in key_text
+        if key_name == "ctrl_any":
+            return key in (
+                self.keyboard.Key.ctrl,
+                self.keyboard.Key.ctrl_l,
+                self.keyboard.Key.ctrl_r,
+            ) or "ctrl" in key_text
+        return False
 
     def on_press(self, key):
-        if key in (self.keyboard.Key.alt_r, self.keyboard.Key.alt_gr):
+        if self._matches_toggle_key(key):
             self.trigger_toggle()
-        elif self._is_ctrl_cancel_key(key):
+        elif self._matches_cancel_key(key):
             log(f"Cancel hotkey keypress: {key}")
             self.trigger_cancel()
 

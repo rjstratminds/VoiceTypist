@@ -29,7 +29,14 @@ The implementation is intentionally simple:
 
 ### 2. Toggle Dictation
 
-The hotkey is a double-press of Right Alt within a short window.
+The hotkey is configurable.
+
+Defaults:
+
+- `toggle_key: alt_r`
+- `toggle_press_mode: double`
+- `cancel_key: ctrl_r`
+- `cancel_press_mode: double`
 
 On start:
 
@@ -61,7 +68,7 @@ Backend switching is separate from recording:
 - the tray menu can switch between Whisper and Parakeet
 - switching writes the config file and restarts the user service
 - recording itself is still controlled by the hotkey path
-- double `Right Ctrl` cancels the active recording
+- the configured cancel hotkey cancels the active recording
 
 ## Components
 
@@ -198,8 +205,13 @@ If both backends fail, the app stays alive but logs why hotkeys are disabled.
 
 The current `pynput` path also handles:
 
-- double `Right Alt` for toggle
-- double `Right Ctrl` for cancel
+- configurable toggle and cancel keys
+
+For virtual-keyboard remappers such as Toshy/XWayKeyz:
+
+- `evdev` may intentionally bind to the remapper’s virtual keyboard
+- `toggle_key: alt_any` is often safer than assuming a specific physical right-Alt key
+- `toggle_press_mode: single` gives one-press start and one-press stop
 
 ## Desktop Session Requirements
 

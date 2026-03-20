@@ -75,6 +75,10 @@ model: ~/whisper.cpp/models/ggml-small.en.bin
 whisper_bin: ~/whisper.cpp/build/bin/whisper-cli
 whisper_threads: 8
 type_backend: auto
+toggle_key: alt_r
+toggle_press_mode: double
+cancel_key: ctrl_r
+cancel_press_mode: double
 parakeet_model: nvidia/parakeet-tdt-0.6b-v3
 gemini_model: gemini-2.5-flash-lite
 audio_source: default
@@ -230,6 +234,17 @@ On GNOME/X11-style hosts, you may instead see:
 On Plasma/Wayland-style hosts with AppIndicator support, you may see:
 
 - `Tray icon started (AppIndicator)`
+
+If you use Toshy, XWayKeyz, or another keyboard remapper that exposes a virtual keyboard device, `evdev` may bind to that device instead of the laptop’s physical keyboard. That is fine as long as the remapped key still appears to Linux as the configured `toggle_key`.
+
+Useful hotkey configs:
+
+```yaml
+toggle_key: alt_any
+toggle_press_mode: single
+cancel_key: ctrl_r
+cancel_press_mode: double
+```
 
 If `type_backend` is `ydotool`, also verify the daemon first:
 

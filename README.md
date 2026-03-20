@@ -77,6 +77,10 @@ Current keys:
 - `whisper_bin`: path to `whisper-cli`
 - `whisper_threads`: thread count passed to `whisper-cli`
 - `type_backend`: `auto`, `ydotool`, or `xdotool`
+- `toggle_key`: `alt_l`, `alt_r`, `alt_gr`, `alt_any`, `ctrl_l`, `ctrl_r`, or `ctrl_any`
+- `toggle_press_mode`: `single` or `double`
+- `cancel_key`: same key-name format as `toggle_key`
+- `cancel_press_mode`: `single` or `double`
 - `parakeet_model`: NeMo model name
 - `gemini_model`: Gemini model ID used when `GOOGLE_API_KEY` is present
 - `rewrite_system_prompt`: prompt used for Gemini transcript refinement
@@ -90,6 +94,10 @@ model: ~/whisper.cpp/models/ggml-small.en.bin
 whisper_bin: ~/whisper.cpp/build/bin/whisper-cli
 whisper_threads: 8
 type_backend: auto
+toggle_key: alt_r
+toggle_press_mode: double
+cancel_key: ctrl_r
+cancel_press_mode: double
 parakeet_model: nvidia/parakeet-tdt-0.6b-v3
 gemini_model: gemini-2.5-flash-lite
 rewrite_system_prompt: |
@@ -165,8 +173,16 @@ Hotkey backends are tried in this order:
 
 Current hotkey behavior:
 
-- double `Right Alt`: start dictation, or finish and transcribe if already recording
-- double `Right Ctrl`: cancel the current recording without transcription
+- controlled by `toggle_key` plus `toggle_press_mode`
+- controlled by `cancel_key` plus `cancel_press_mode`
+
+Typical examples:
+
+- `toggle_key: alt_r` with `toggle_press_mode: double`
+- `toggle_key: alt_any` with `toggle_press_mode: single`
+- `cancel_key: ctrl_r` with `cancel_press_mode: double`
+
+For Toshy/XWayKeyz or other virtual-keyboard remappers, `toggle_key: alt_any` is often more reliable than hard-coding `alt_r`, because the remapper may expose a transformed Alt key through a virtual input device.
 
 Typing output backends:
 
