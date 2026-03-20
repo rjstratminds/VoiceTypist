@@ -33,6 +33,8 @@ The hotkey is configurable.
 
 Defaults:
 
+- `hotkey_backend: auto`
+- `hotkey_device: auto`
 - `toggle_key: alt_r`
 - `toggle_press_mode: double`
 - `cancel_key: ctrl_r`
@@ -212,6 +214,7 @@ For virtual-keyboard remappers such as Toshy/XWayKeyz:
 - `evdev` may intentionally bind to the remapper’s virtual keyboard
 - `toggle_key: alt_any` is often safer than assuming a specific physical right-Alt key
 - `toggle_press_mode: single` gives one-press start and one-press stop
+- `hotkey_device: physical` lets the `evdev` path prefer the laptop keyboard when you want to bypass the virtual remapper device
 
 ## Desktop Session Requirements
 
@@ -240,6 +243,8 @@ Current config keys:
 - `whisper_bin`
 - `whisper_threads`
 - `type_backend`
+- `hotkey_backend`
+- `hotkey_device`
 - `parakeet_model`
 - `gemini_model`
 - `rewrite_system_prompt`

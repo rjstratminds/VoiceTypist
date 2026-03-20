@@ -77,6 +77,8 @@ Current keys:
 - `whisper_bin`: path to `whisper-cli`
 - `whisper_threads`: thread count passed to `whisper-cli`
 - `type_backend`: `auto`, `ydotool`, or `xdotool`
+- `hotkey_backend`: `auto`, `evdev`, or `pynput`
+- `hotkey_device`: `auto` or `physical`
 - `toggle_key`: `alt_l`, `alt_r`, `alt_gr`, `alt_any`, `ctrl_l`, `ctrl_r`, or `ctrl_any`
 - `toggle_press_mode`: `single` or `double`
 - `cancel_key`: same key-name format as `toggle_key`
@@ -94,6 +96,8 @@ model: ~/whisper.cpp/models/ggml-small.en.bin
 whisper_bin: ~/whisper.cpp/build/bin/whisper-cli
 whisper_threads: 8
 type_backend: auto
+hotkey_backend: auto
+hotkey_device: auto
 toggle_key: alt_r
 toggle_press_mode: double
 cancel_key: ctrl_r
@@ -184,6 +188,13 @@ Typical examples:
 
 For Toshy/XWayKeyz or other virtual-keyboard remappers, `toggle_key: alt_any` is often more reliable than hard-coding `alt_r`, because the remapper may expose a transformed Alt key through a virtual input device.
 
+Hotkey source selection:
+
+- `hotkey_backend: auto` tries `evdev` first, then `pynput`
+- `hotkey_backend: evdev` forces Linux input-device events
+- `hotkey_backend: pynput` forces the X11 listener path
+- `hotkey_device: physical` tells the `evdev` path to prefer a non-virtual keyboard when both virtual and physical devices are present
+
 Typing output backends:
 
 - `ydotool` when `type_backend` is `ydotool` or `auto` and the daemon socket is available
@@ -264,6 +275,8 @@ Shared code handles:
 
 - tray backend auto-selection
 - typing backend selection
+- hotkey backend selection
+- physical-versus-virtual keyboard preference
 - Whisper thread configuration
 - CUDA-capable Whisper binary paths
 
@@ -272,6 +285,10 @@ Machine-specific configuration should stay in `~/.config/voicetypist-linux/confi
 - `whisper_bin`
 - `whisper_threads`
 - `type_backend`
+- `hotkey_backend`
+- `hotkey_device`
+- `toggle_key`
+- `toggle_press_mode`
 - `audio_source`
 
 ## Inspiration

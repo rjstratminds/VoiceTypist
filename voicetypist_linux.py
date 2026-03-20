@@ -48,6 +48,8 @@ DEFAULT_CONFIG = {
     "whisper_bin": "~/whisper.cpp/build/bin/whisper-cli",
     "whisper_threads": max(os.cpu_count() or 4, 1),
     "type_backend": "auto",
+    "hotkey_backend": "auto",
+    "hotkey_device": "auto",
     "toggle_key": "alt_r",
     "toggle_press_mode": "double",
     "cancel_key": "ctrl_r",
@@ -225,6 +227,12 @@ if "parakeet_model" not in config:
 
 if "type_backend" not in config:
     config["type_backend"] = "auto"
+
+if "hotkey_backend" not in config:
+    config["hotkey_backend"] = "auto"
+
+if "hotkey_device" not in config:
+    config["hotkey_device"] = "auto"
 
 if "toggle_key" not in config:
     config["toggle_key"] = DEFAULT_CONFIG["toggle_key"]
@@ -1333,6 +1341,8 @@ class EvdevAltHotkey(HotkeyBase):
 
         keyboards = []
         preferred_devices = []
+        physical_preferred = []
+        device_mode = str(config.get("hotkey_device", "auto")).lower()
 
         for device in devices:
             name = (device.name or "").lower()
@@ -1340,6 +1350,15 @@ class EvdevAltHotkey(HotkeyBase):
                 keyboards.append(device)
             if self._supports_key(device, toggle_key_name()):
                 preferred_devices.append(device)
+                if not any(token in name for token in ("virtual", "xwaykeyz", "toshy", "keyd", "uinput")):
+                    physical_preferred.append(device)
+
+        if device_mode == "physical":
+            for candidate in physical_preferred:
+                if candidate in keyboards:
+                    return candidate
+            if physical_preferred:
+                return physical_preferred[0]
 
         for candidate in preferred_devices:
             if candidate in keyboards:
@@ -1437,16 +1456,21 @@ class AltHotkey:
 
     def _build_backend(self):
         reasons = []
+        preferred_backend = str(config.get("hotkey_backend", "auto")).lower()
 
-        try:
-            return EvdevAltHotkey()
-        except Exception as exc:
-            reasons.append(f"evdev: {exc}")
+        backend_builders = []
+        if preferred_backend == "evdev":
+            backend_builders = [("evdev", EvdevAltHotkey)]
+        elif preferred_backend == "pynput":
+            backend_builders = [("pynput", PynputAltHotkey)]
+        else:
+            backend_builders = [("evdev", EvdevAltHotkey), ("pynput", PynputAltHotkey)]
 
-        try:
-            return PynputAltHotkey()
-        except Exception as exc:
-            reasons.append(f"pynput: {exc}")
+        for backend_name, builder in backend_builders:
+            try:
+                return builder()
+            except Exception as exc:
+                reasons.append(f"{backend_name}: {exc}")
 
         return DisabledHotkey(reasons)
 

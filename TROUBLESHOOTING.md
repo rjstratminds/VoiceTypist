@@ -211,6 +211,8 @@ Check your configured hotkey fields in:
 
 Relevant keys:
 
+- `hotkey_backend`
+- `hotkey_device`
 - `toggle_key`
 - `toggle_press_mode`
 - `cancel_key`
@@ -222,6 +224,7 @@ If you use Toshy or another virtual keyboard remapper:
 - if it shows a virtual keyboard, that is expected
 - prefer `toggle_key: alt_any` if the remapper makes `alt_r` unreliable
 - use `toggle_press_mode: single` if you want one press to start and one press to stop
+- if you want the physical keyboard instead of the remapper device, try `hotkey_backend: evdev` with `hotkey_device: physical`
 
 ## Parakeet Backend Fails To Start
 

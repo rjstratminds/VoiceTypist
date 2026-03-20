@@ -75,6 +75,8 @@ model: ~/whisper.cpp/models/ggml-small.en.bin
 whisper_bin: ~/whisper.cpp/build/bin/whisper-cli
 whisper_threads: 8
 type_backend: auto
+hotkey_backend: auto
+hotkey_device: auto
 toggle_key: alt_r
 toggle_press_mode: double
 cancel_key: ctrl_r
@@ -244,6 +246,13 @@ toggle_key: alt_any
 toggle_press_mode: single
 cancel_key: ctrl_r
 cancel_press_mode: double
+```
+
+If a host has both a physical keyboard and a remapper-created virtual keyboard, you can also force the physical device on the `evdev` path:
+
+```yaml
+hotkey_backend: evdev
+hotkey_device: physical
 ```
 
 If `type_backend` is `ydotool`, also verify the daemon first:
